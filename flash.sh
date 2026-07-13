@@ -24,7 +24,10 @@ GH_ORG="backbone-ai"
 REPO="backbone"
 WORK_ROOT="$HOME/backbone-ai"
 DEST="$WORK_ROOT/$REPO"
-DETERMINATE_NIX_INSTALLER="https://install.determinate.systems/nix"
+# Determinate's macOS *package* — their recommended, most robust install. The plain
+# nix-installer script's encrypted-/nix-APFS-volume dance fails on some Macs ("Volume …
+# failed to mount") and can't recover a partial prior attempt; the pkg is hardened for both.
+DETERMINATE_NIX_PKG="https://install.determinate.systems/determinate-pkg/stable/Universal"
 
 log() { printf '\033[1;36m[flash]\033[0m %s\n' "$*"; }
 ok()  { printf '\033[1;32m[flash]\033[0m %s\n' "$*"; }
@@ -82,11 +85,16 @@ if [ "$STATUS_ONLY" -eq 1 ]; then
   exit 0
 fi
 
-# 1. Nix — reuse ANY existing install; install only when truly absent.
+# 1. Nix — reuse ANY existing install; install only when truly absent. Install via the
+#    Determinate macOS package (robust: the plain nix-installer's /nix APFS volume is flaky).
 case "$(nix_flavor)" in
 none)
-  log "installing Determinate Nix (asks for your macOS password once)…"
-  curl -fsSL "$DETERMINATE_NIX_INSTALLER" | sh -s -- install --determinate --no-confirm
+  log "installing Determinate Nix (macOS package; asks for your password once)…"
+  pkg="$(mktemp -d)/determinate-nix.pkg"
+  curl -fsSL "$DETERMINATE_NIX_PKG" -o "$pkg" \
+    || die "couldn't download the Determinate Nix package from $DETERMINATE_NIX_PKG"
+  sudo installer -pkg "$pkg" -target / \
+    || die "Determinate Nix package install failed — if it names a leftover 'Nix Store' volume, run 'diskutil apfs list | grep -i nix', delete that volume, reboot, then re-run."
   source_existing_nix
   ;;
 upstream)

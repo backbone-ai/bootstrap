@@ -22,8 +22,18 @@ set -euo pipefail
 
 GH_ORG="backbone-ai"
 REPO="backbone"
-WORK_ROOT="$HOME/backbone-ai"
+# The work root a laptop shares with a devbox, so one surface's recorded path is readable by
+# the other's. scripts/laptop_layout.py is the SSOT for these; they are spelled literally here
+# because this file runs BEFORE any checkout exists to read them from, and
+# scripts/check_macos_provision_drift.py fails when the spellings diverge.
+DATA_ROOT="/data"
+WORK_ROOT="$DATA_ROOT/$GH_ORG"
 DEST="$WORK_ROOT/$REPO"
+# Where the first clone lands. It cannot be $DEST: macOS seals the root volume, so /data does
+# not exist until a manifest is written and stitched — and the program that does that ships
+# IN this repository. So stage the clone somewhere that always works, run the placement logic
+# out of it, and let that move the tree to $DEST once /data is live.
+STAGING="$HOME/.cache/backbone-bootstrap/$REPO"
 # Determinate's macOS *package* — their recommended, most robust install. The plain
 # nix-installer script's encrypted-/nix-APFS-volume dance fails on some Macs ("Volume …
 # failed to mount") and can't recover a partial prior attempt; the pkg is hardened for both.
@@ -74,14 +84,23 @@ nix_flavor() {
 nx() { nix --extra-experimental-features 'nix-command flakes' run "nixpkgs#$1" -- "${@:2}"; }
 
 gh_authed()   { have_nix && nx gh auth status --hostname github.com >/dev/null 2>&1; }
-repo_cloned() { [ -d "$DEST/.git" ]; }
+
+# The checkout to work out of: the canonical one when /data has been provisioned, else the
+# staged clone (a machine that has not rebooted yet keeps its checkout where it landed).
+checkout_path() {
+  if [ -d "$DEST/.git" ]; then echo "$DEST"
+  elif [ -d "$STAGING/.git" ]; then echo "$STAGING"
+  fi
+}
+repo_cloned() { [ -n "$(checkout_path)" ]; }
 
 source_existing_nix
 
 if [ "$STATUS_ONLY" -eq 1 ]; then
   printf '%-20s %s\n' "nix:" "$(nix_flavor)$(have_nix && printf ' (%s)' "$(nix --version 2>/dev/null | head -1)")"
   printf '%-20s %s\n' "github auth:" "$(gh_authed && echo authenticated || echo 'not authenticated')"
-  printf '%-20s %s\n' "backbone checkout:" "$(repo_cloned && echo "$DEST" || echo absent)"
+  printf '%-20s %s\n' "backbone checkout:" "$(repo_cloned && checkout_path || echo absent)"
+  printf '%-20s %s\n' "$DATA_ROOT work root:" "$([ -d "$WORK_ROOT" ] && echo "$WORK_ROOT" || echo 'not provisioned (created by the nix-darwin switch)')"
   exit 0
 fi
 
@@ -93,7 +112,10 @@ none)
   pkg="$(mktemp -d)/determinate-nix.pkg"
   curl -fsSL "$DETERMINATE_NIX_PKG" -o "$pkg" \
     || die "couldn't download the Determinate Nix package from $DETERMINATE_NIX_PKG"
-  sudo installer -pkg "$pkg" -target / \
+  # -H: root runs with HOME=/var/root, not this account's — sudo does not reset HOME on
+  # its own, and unlike nix (which only warns and falls back to the passwd entry) a
+  # less careful tool would write root-owned files straight into this $HOME.
+  sudo -H installer -pkg "$pkg" -target / \
     || die "Determinate Nix package install failed — if it names a leftover 'Nix Store' volume, run 'diskutil apfs list | grep -i nix', delete that volume, reboot, then re-run."
   source_existing_nix
   ;;
@@ -117,26 +139,59 @@ else
     || die "GitHub auth did not complete — re-run this command to retry."
 fi
 
-# 3. Clone backbone into the canonical WORK_ROOT the devbox uses. Only backbone is needed
-#    to reach the wizard; the wizard reconciles the rest (backbone-deploy) over the proper
-#    SSH/1Password path once that auth is up.
-mkdir -p "$WORK_ROOT"
+# 3. Clone backbone. Only backbone is needed to reach the wizard; the wizard reconciles the
+#    rest (backbone-deploy) over the proper SSH/1Password path once that auth is up.
 if repo_cloned; then
-  ok "$DEST already cloned — the provisioner will fetch it."
+  ok "$(checkout_path) already cloned — the provisioner will fetch it."
 else
-  log "cloning $GH_ORG/$REPO -> $DEST…"
-  nx gh repo clone "$GH_ORG/$REPO" "$DEST" \
+  log "cloning $GH_ORG/$REPO -> $STAGING…"
+  mkdir -p "$(dirname "$STAGING")"
+  nx gh repo clone "$GH_ORG/$REPO" "$STAGING" \
     || die "clone failed — check your GitHub access to $GH_ORG/$REPO, then re-run."
 fi
 
-# 4. Hand off to the in-repo provisioner's FULL guided run (not --checkout, which is a
+# 4. Place the checkout under $WORK_ROOT, provisioning /data on the way. Root is required to
+#    write /etc and the data volume's root, so realize a python3 out of the store FIRST and
+#    sudo that absolute path — `sudo nix run` would need nix on root's PATH, which a fresh
+#    Determinate install has not necessarily arranged. Exit 2 means "left staged, awaiting a
+#    reboot", which is a state and not a failure, so it is reported and the flow continues.
+CHECKOUT="$(checkout_path)"
+if [ "$CHECKOUT" != "$DEST" ]; then
+  log "provisioning $DATA_ROOT and placing the checkout…"
+  PY="$(nix --extra-experimental-features 'nix-command flakes' build --no-link --print-out-paths nixpkgs#python3)/bin/python3" \
+    || die "could not realize a python3 from nixpkgs — re-run, or check your nix install."
+  set +e
+  # -H (same rationale as the installer call above): the owner to place the checkout
+  # under is passed explicitly via --owner, never inferred from root's $HOME.
+  PLACED="$(sudo -H "$PY" "$CHECKOUT/scripts/macos_data_volume.py" place-checkout \
+    --staged "$CHECKOUT" --data-root "$DATA_ROOT" --work-root "$WORK_ROOT" \
+    --owner "$(id -un)" --repo-name "$REPO")"
+  place_rc=$?
+  set -e
+  case "$place_rc" in
+  0) CHECKOUT="$PLACED"; ok "checkout in place at $CHECKOUT" ;;
+  2)
+    CHECKOUT="$PLACED"
+    ok "checkout staged at $CHECKOUT — $DATA_ROOT applies at the next boot (or: sudo /System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util -t)."
+    log "after that, move it to $DEST — or keep it here and register it (BACKBONE_HOME)."
+    ;;
+  *) die "could not provision $DATA_ROOT — see the messages above, then re-run." ;;
+  esac
+fi
+
+# 5. Hand off to the in-repo provisioner's FULL guided run (not --checkout, which is a
 #    clone-only mode). It installs the whole toolchain — Xcode CLT, nix-darwin,
 #    home-manager, 1Password op + git-signing, colima — each step itself detection-first
 #    (its own status->set->heal ladder), and does its own repo checkout over SSH. Run it
 #    with a nix python3, since a bare Mac has no python3 until CLT (which the wizard
 #    installs); the wizard is stdlib-only by design, so nix's python3 runs it as-is, and
 #    from then on the native `make provision-macos` works. Args flow straight through.
+#
+# BACKBONE_HOME registers whichever tree the checkout actually landed in, so a run that
+# degraded to the staged location provisions THAT tree rather than a canonical path which
+# does not exist yet.
 log "handing off to the native provisioner (installs the full toolchain)…"
-cd "$DEST"
+cd "$CHECKOUT"
+export BACKBONE_HOME="$CHECKOUT"
 exec nix --extra-experimental-features 'nix-command flakes' run nixpkgs#python3 -- \
-  scripts/provision_macos.py "$@"
+  "$CHECKOUT/scripts/provision_macos.py" "$@"
